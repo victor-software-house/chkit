@@ -1,0 +1,71 @@
+%YAML 1.2
+---
+schema: 1
+downstream:
+  remote: origin
+  branch: main
+  recovery_tag_prefix: forkctl/recovery
+  publish: append
+upstream:
+  remote: upstream
+  url: https://github.com/obsessiondb/chkit.git
+  fetch_ref: refs/heads/main
+base:
+  target:
+    kind: commit
+    selector: 97949a3a0bb928546a156f5c31630b9e3857e2d6
+    commit: 97949a3a0bb928546a156f5c31630b9e3857e2d6
+  canonical: 97949a3a0bb928546a156f5c31630b9e3857e2d6
+  stack: 97949a3a0bb928546a156f5c31630b9e3857e2d6
+documents:
+  ledger: patches/LEDGER.md
+  exports: patches/exports
+bookkeeping_patch: fork-bookkeeping
+patches:
+  - name: index-type-full
+    kind: source
+    purpose: >-
+      Drift and pull read index arguments from
+      system.data_skipping_indices.type_full; type holds only the name, so every parameterised index showed as changed.
+    upstream_status: submitted
+    drop_when: "obsessiondb/chkit#211 (https://github.com/obsessiondb/chkit/pull/211) is merged and the base is rebased past it."
+    scope:
+      - packages/clickhouse/src/**
+      - packages/plugin-obsessiondb/src/**
+      - packages/cli/src/test/**
+      - chkit_python/src/chkit/clickhouse/**
+      - chkit_python/tests/**
+      - .changeset/**
+      - packages/cli/src/commands/drift/**
+      - chkit_python/src/chkit/cli/commands/**
+  - name: text-index-type
+    kind: source
+    purpose: >-
+      Model the ClickHouse text index (GA since 26.2) as a skip index type so schemas
+      can declare, pull, migrate, and drift-check it.
+    upstream_status: submitted
+    drop_when: "obsessiondb/chkit#212 (https://github.com/obsessiondb/chkit/pull/212) is merged and the base is rebased past it."
+    scope:
+      - packages/core/src/**
+      - packages/clickhouse/src/**
+      - packages/cli/src/**
+      - packages/plugin-pull/src/**
+      - apps/docs/src/content/docs/schema/**
+      - chkit_python/src/**
+      - chkit_python/tests/**
+      - .changeset/**
+  - name: fork-bookkeeping
+    kind: tooling
+    purpose: Own fork policy, generated evidence, and integration configuration.
+    upstream_status: "inappropriate: downstream-only fork maintenance"
+    drop_when: The downstream fork is retired.
+    scope:
+      - patches/fork.yaml
+      - patches/LEDGER.md
+      - patches/exports/**
+      - mise.toml
+disabled_patches: []
+history: []
+contracts:
+  allow_base: []
+  required_text: []
