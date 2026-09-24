@@ -1,0 +1,1198 @@
+text-index-type
+
+From: Victor Araújo <victor@victor-software-house.com>
+
+Downstream-Reason: Model the ClickHouse text index (GA since 26.2) as a skip index type so schemas can declare, pull, migrate, and drift-check it.
+Upstream-Status: not-submitted
+Drop-When: Upstream chkit supports the text skip index type.
+---
+ .changeset/text-skip-index.md                      |    8 ++
+ .../docs/src/content/docs/schema/dsl-reference.mdx |    3 -
+ chkit_python/src/chkit/__init__.py                 |    2 
+ .../src/chkit/cli/commands/drift_compare.py        |    3 +
+ chkit_python/src/chkit/cli/commands/pull.py        |    2 
+ chkit_python/src/chkit/cli/commands/pull_render.py |   17 ++++
+ chkit_python/src/chkit/clickhouse/introspect.py    |    9 ++
+ chkit_python/src/chkit/core/canonical.py           |    9 ++
+ chkit_python/src/chkit/core/model.py               |   30 +++++++
+ chkit_python/src/chkit/core/sql.py                 |    9 +-
+ chkit_python/src/chkit/core/text_index.py          |   75 ++++++++++++++++++
+ chkit_python/src/chkit/core/validate.py            |   36 ++++++---
+ chkit_python/tests/test_index_parity.py            |   68 ++++++++++++++++
+ chkit_python/tests/test_introspect.py              |   22 +++++
+ chkit_python/tests/test_pull.py                    |   27 +++++++
+ chkit_python/tests/test_sql_validation_e2e.py      |   22 +++++
+ packages/cli/src/commands/drift/compare.ts         |    3 +
+ packages/cli/src/test/drift.e2e.test.ts            |   52 +++++++++++++
+ packages/clickhouse/src/index.test.ts              |   42 ++++++++++
+ packages/clickhouse/src/index.ts                   |    7 +-
+ packages/core/src/canonical.ts                     |    7 +-
+ packages/core/src/index.test.ts                    |   50 ++++++++++++
+ packages/core/src/index.ts                         |    1 
+ packages/core/src/model-types.ts                   |   15 ++++
+ packages/core/src/sql-validation.e2e.test.ts       |   22 +++++
+ packages/core/src/sql.ts                           |    3 +
+ packages/core/src/text-index.ts                    |   83 ++++++++++++++++++++
+ packages/core/src/validate.ts                      |    8 ++
+ packages/plugin-pull/src/index.test.ts             |   11 +++
+ packages/plugin-pull/src/render-schema.ts          |   12 +++
+ 30 files changed, 637 insertions(+), 21 deletions(-)
+ create mode 100644 .changeset/text-skip-index.md
+ create mode 100644 chkit_python/src/chkit/core/text_index.py
+ create mode 100644 packages/core/src/text-index.ts
+
+diff --git a/.changeset/text-skip-index.md b/.changeset/text-skip-index.md
+new file mode 100644
+index 0000000..ab5dc80
+--- /dev/null
++++ b/.changeset/text-skip-index.md
+@@ -0,0 +1,8 @@
++---
++"@chkit/core": patch
++"@chkit/clickhouse": patch
++"@chkit/plugin-pull": patch
++"chkit": patch
++---
++
++Add the ClickHouse `text` skip index (GA in 26.2) as `type: 'text'`, with a required `tokenizer` and the optional `preprocessor`, `postprocessor`, `supportPhraseSearch`, `dictionaryBlockSize`, `dictionaryBlockFrontcodingCompression`, `postingListBlockSize`, and `postingListCodec`. chkit renders the parameters in a fixed order, and introspection parses `type_full` by key, so `chkit drift` stays clean whatever order the DDL used. `chkit pull` writes the fields back, validation reports `text_index_missing_tokenizer`, and chkit-py has the same support as `SkipIndexText`.
+diff --git a/apps/docs/src/content/docs/schema/dsl-reference.mdx b/apps/docs/src/content/docs/schema/dsl-reference.mdx
+index 8236164..bef8725 100644
+--- a/apps/docs/src/content/docs/schema/dsl-reference.mdx
++++ b/apps/docs/src/content/docs/schema/dsl-reference.mdx
+@@ -358,7 +358,7 @@ Each entry in the `indexes` array is a `SkipIndexDefinition`. The shared base fi
+ |-------|------|-------------|
+ | `name` | `string` | Index name |
+ | `expression` | `string` | Indexed expression |
+-| `type` | `'minmax' \| 'set' \| 'bloom_filter' \| 'tokenbf_v1' \| 'ngrambf_v1'` | Index type |
++| `type` | `'minmax' \| 'set' \| 'bloom_filter' \| 'tokenbf_v1' \| 'ngrambf_v1' \| 'text'` | Index type |
+ | `granularity` | `number` | Index granularity |
+ 
+ Type-specific fields:
+@@ -370,6 +370,7 @@ Type-specific fields:
+ | `bloom_filter` | — | `falsePositiveRate: number` | Defaults to `0.025` when omitted |
+ | `tokenbf_v1` | `sizeBytes`, `hashFunctions`, `randomSeed` (all `number`) | — | Maps to `tokenbf_v1(size_bytes, n_hash, seed)` |
+ | `ngrambf_v1` | `ngramSize`, `sizeBytes`, `hashFunctions`, `randomSeed` (all `number`) | — | Maps to `ngrambf_v1(n, size_bytes, n_hash, seed)` |
++| `text` | `tokenizer: string` (SQL, e.g. `'splitByNonAlpha'`, `'ngrams(3)'`) | `preprocessor`, `postprocessor` (SQL `string`); `supportPhraseSearch`, `dictionaryBlockFrontcodingCompression` (`boolean`); `dictionaryBlockSize`, `postingListBlockSize` (`number`); `postingListCodec: 'none' \| 'bitpacking'` | Maps to `text(tokenizer = …, …)` in a fixed parameter order. Needs ClickHouse 26.2 or newer; `supportPhraseSearch` also needs the MergeTree setting `allow_experimental_text_index_phrase_search` |
+ 
+ <Tabs syncKey="lang">
+   <TabItem label="TypeScript">
+diff --git a/chkit_python/src/chkit/__init__.py b/chkit_python/src/chkit/__init__.py
+index c4c43c2..fe1fe44 100644
+--- a/chkit_python/src/chkit/__init__.py
++++ b/chkit_python/src/chkit/__init__.py
+@@ -47,6 +47,7 @@ from chkit.core.model import (
+     SkipIndexMinmax,
+     SkipIndexNgramBF,
+     SkipIndexSet,
++    SkipIndexText,
+     SkipIndexTokenBF,
+ )
+ 
+@@ -75,6 +76,7 @@ __all__ = [
+     "SkipIndexMinmax",
+     "SkipIndexNgramBF",
+     "SkipIndexSet",
++    "SkipIndexText",
+     "SkipIndexTokenBF",
+     "TableDefinition",
+     "TableRef",
+diff --git a/chkit_python/src/chkit/cli/commands/drift_compare.py b/chkit_python/src/chkit/cli/commands/drift_compare.py
+index 96b6837..1ae09ac 100644
+--- a/chkit_python/src/chkit/cli/commands/drift_compare.py
++++ b/chkit_python/src/chkit/cli/commands/drift_compare.py
+@@ -29,6 +29,7 @@ from chkit.core.model import (
+ )
+ from chkit.core.projection import is_index_projection, normalize_projection_index
+ from chkit.core.sql_normalizer import normalize_engine, normalize_sql_fragment
++from chkit.core.text_index import render_text_index_type
+ 
+ _MIN_QUOTED_LEN = 2
+ 
+@@ -259,6 +260,8 @@ def _render_index_type_fingerprint(index: SkipIndexDefinition) -> str:
+             f"tokenbf_v1({index.size_bytes}, "
+             f"{index.hash_functions}, {index.random_seed})"
+         )
++    if index.type == "text":
++        return render_text_index_type(index)
+     return (
+         f"ngrambf_v1({index.ngram_size}, {index.size_bytes}, "
+         f"{index.hash_functions}, {index.random_seed})"
+diff --git a/chkit_python/src/chkit/cli/commands/pull.py b/chkit_python/src/chkit/cli/commands/pull.py
+index 0e3ccf1..c33d5de 100644
+--- a/chkit_python/src/chkit/cli/commands/pull.py
++++ b/chkit_python/src/chkit/cli/commands/pull.py
+@@ -65,6 +65,7 @@ from chkit.core.model import (
+     SkipIndexMinmax,
+     SkipIndexNgramBF,
+     SkipIndexSet,
++    SkipIndexText,
+     SkipIndexTokenBF,
+     TableDefinition,
+     TableRef,
+@@ -92,6 +93,7 @@ def _introspected_table_to_definition(
+         | SkipIndexBloomFilter
+         | SkipIndexTokenBF
+         | SkipIndexNgramBF
++        | SkipIndexText
+         | dict[str, object]
+     ] = list(item.indexes)
+ 
+diff --git a/chkit_python/src/chkit/cli/commands/pull_render.py b/chkit_python/src/chkit/cli/commands/pull_render.py
+index 3df505e..9576094 100644
+--- a/chkit_python/src/chkit/cli/commands/pull_render.py
++++ b/chkit_python/src/chkit/cli/commands/pull_render.py
+@@ -99,6 +99,7 @@ def render_schema_file(  # noqa: PLR0912, PLR0915
+                     "bloom_filter": "SkipIndexBloomFilter",
+                     "tokenbf_v1": "SkipIndexTokenBF",
+                     "ngrambf_v1": "SkipIndexNgramBF",
++                    "text": "SkipIndexText",
+                 }[idx.type]
+             )
+ 
+@@ -245,6 +246,21 @@ def _render_index(index: SkipIndexDefinition) -> str:
+         parts.append(f"size_bytes={index.size_bytes}")
+         parts.append(f"hash_functions={index.hash_functions}")
+         parts.append(f"random_seed={index.random_seed}")
++    elif index.type == "text":
++        parts.append(f"tokenizer={_render_string(index.tokenizer)}")
++        for field in ("preprocessor", "postprocessor", "posting_list_codec"):
++            value = getattr(index, field)
++            if value is not None:
++                parts.append(f"{field}={_render_string(value)}")
++        for field in (
++            "support_phrase_search",
++            "dictionary_block_size",
++            "dictionary_block_frontcoding_compression",
++            "posting_list_block_size",
++        ):
++            value = getattr(index, field)
++            if value is not None:
++                parts.append(f"{field}={value}")
+     parts.append(f"granularity={index.granularity}")
+     type_class = {
+         "minmax": "SkipIndexMinmax",
+@@ -252,6 +268,7 @@ def _render_index(index: SkipIndexDefinition) -> str:
+         "bloom_filter": "SkipIndexBloomFilter",
+         "tokenbf_v1": "SkipIndexTokenBF",
+         "ngrambf_v1": "SkipIndexNgramBF",
++        "text": "SkipIndexText",
+     }[index.type]
+     return f"{type_class}({', '.join(parts)})"
+ 
+diff --git a/chkit_python/src/chkit/clickhouse/introspect.py b/chkit_python/src/chkit/clickhouse/introspect.py
+index 1d05d8a..4942071 100644
+--- a/chkit_python/src/chkit/clickhouse/introspect.py
++++ b/chkit_python/src/chkit/clickhouse/introspect.py
+@@ -45,9 +45,11 @@ from chkit.core.model import (
+     SkipIndexMinmax,
+     SkipIndexNgramBF,
+     SkipIndexSet,
++    SkipIndexText,
+     SkipIndexTokenBF,
+ )
+ from chkit.core.sql_normalizer import normalize_sql_fragment
++from chkit.core.text_index import parse_text_index_params
+ 
+ SchemaObjectKind: TypeAlias = Literal["table", "view", "materialized_view", "dictionary"]
+ 
+@@ -122,7 +124,7 @@ class IntrospectedTable:
+ 
+ 
+ _NULLABLE_RE = re.compile(r"^Nullable\((.+)\)$")
+-_INDEX_TYPE_RE = re.compile(r"^(\w+)\((.+)\)$")
++_INDEX_TYPE_RE = re.compile(r"^(\w+)\((.+)\)$", re.DOTALL)
+ 
+ 
+ def infer_schema_kind_from_engine(engine: str) -> SchemaObjectKind | None:
+@@ -215,6 +217,11 @@ def normalize_index_from_system_row(row: SystemSkippingIndexRow) -> SkipIndexDef
+     if base_name == "minmax":
+         return SkipIndexMinmax(**base_payload)
+ 
++    if base_name == "text":
++        return SkipIndexText.model_validate(
++            {**base_payload, **parse_text_index_params(args_str or "")}
++        )
++
+     if base_name == "bloom_filter":
+         floats = _split_float_args(args_str)
+         rate = floats[0] if floats else None
+diff --git a/chkit_python/src/chkit/core/canonical.py b/chkit_python/src/chkit/core/canonical.py
+index 6cab269..5b6da9e 100644
+--- a/chkit_python/src/chkit/core/canonical.py
++++ b/chkit_python/src/chkit/core/canonical.py
+@@ -63,7 +63,14 @@ def _canonicalize_column(column: ColumnDefinition) -> ColumnDefinition:
+ 
+ 
+ def _canonicalize_index(index: SkipIndexDefinition) -> SkipIndexDefinition:
+-    return index.model_copy(update={"expression": normalize_sql_fragment(index.expression)})
++    update: dict[str, object] = {"expression": normalize_sql_fragment(index.expression)}
++    if index.type == "text":
++        update["tokenizer"] = normalize_sql_fragment(index.tokenizer)
++        for field in ("preprocessor", "postprocessor"):
++            value = getattr(index, field)
++            if value is not None:
++                update[field] = normalize_sql_fragment(value)
++    return index.model_copy(update=update)
+ 
+ 
+ def _sorted_settings(
+diff --git a/chkit_python/src/chkit/core/model.py b/chkit_python/src/chkit/core/model.py
+index 9214324..19248f5 100644
+--- a/chkit_python/src/chkit/core/model.py
++++ b/chkit_python/src/chkit/core/model.py
+@@ -209,12 +209,39 @@ class SkipIndexNgramBF(_SkipIndexBase):
+     )
+ 
+ 
++class SkipIndexText(_SkipIndexBase):
++    """ClickHouse ``text(...)`` index (26.2+); ``tokenizer`` is required."""
++
++    type: Literal["text"] = "text"
++    tokenizer: str
++    preprocessor: str | None = None
++    postprocessor: str | None = None
++    support_phrase_search: bool | None = Field(default=None, alias="supportPhraseSearch")
++    dictionary_block_size: int | None = Field(default=None, alias="dictionaryBlockSize")
++    dictionary_block_frontcoding_compression: bool | None = Field(
++        default=None, alias="dictionaryBlockFrontcodingCompression"
++    )
++    posting_list_block_size: int | None = Field(default=None, alias="postingListBlockSize")
++    posting_list_codec: Literal["none", "bitpacking"] | None = Field(
++        default=None, alias="postingListCodec"
++    )
++
++    model_config = ConfigDict(
++        frozen=True,
++        extra="forbid",
++        strict=True,
++        validate_assignment=True,
++        populate_by_name=True,
++    )
++
++
+ SkipIndexDefinition: TypeAlias = Annotated[
+     SkipIndexMinmax
+     | SkipIndexSet
+     | SkipIndexBloomFilter
+     | SkipIndexTokenBF
+-    | SkipIndexNgramBF,
++    | SkipIndexNgramBF
++    | SkipIndexText,
+     Field(discriminator="type"),
+ ]
+ 
+@@ -652,6 +679,7 @@ ValidationIssueCode: TypeAlias = Literal[
+     "duplicate_object_name",
+     "duplicate_column_name",
+     "duplicate_index_name",
++    "text_index_missing_tokenizer",
+     "duplicate_projection_name",
+     "projection_ambiguous_kind",
+     "projection_empty_index",
+diff --git a/chkit_python/src/chkit/core/sql.py b/chkit_python/src/chkit/core/sql.py
+index 1f739e1..ed063bb 100644
+--- a/chkit_python/src/chkit/core/sql.py
++++ b/chkit_python/src/chkit/core/sql.py
+@@ -21,12 +21,14 @@ from chkit.core.model import (
+     SkipIndexDefinition,
+     SkipIndexMinmax,
+     SkipIndexSet,
++    SkipIndexText,
+     SkipIndexTokenBF,
+     TableDefinition,
+     TableRef,
+     ViewDefinition,
+ )
+ from chkit.core.projection import render_projection_body
++from chkit.core.text_index import render_text_index_type
+ from chkit.core.validate import assert_valid_definitions
+ 
+ _COLUMN_ADAPTER: TypeAdapter[ColumnDefinition] = TypeAdapter(ColumnDefinition)
+@@ -96,11 +98,12 @@ def _render_index_type(idx: SkipIndexDefinition) -> str:
+     if isinstance(idx, SkipIndexSet):
+         return f"set({idx.max_rows})"
+     if isinstance(idx, SkipIndexBloomFilter):
+-        if idx.false_positive_rate is not None:
+-            return f"bloom_filter({idx.false_positive_rate})"
+-        return "bloom_filter"
++        rate = idx.false_positive_rate
++        return "bloom_filter" if rate is None else f"bloom_filter({rate})"
+     if isinstance(idx, SkipIndexTokenBF):
+         return f"tokenbf_v1({idx.size_bytes}, {idx.hash_functions}, {idx.random_seed})"
++    if isinstance(idx, SkipIndexText):
++        return render_text_index_type(idx)
+     # SkipIndexNgramBF is the only remaining variant in the discriminated union.
+     return (
+         f"ngrambf_v1({idx.ngram_size}, {idx.size_bytes}, {idx.hash_functions}, "
+diff --git a/chkit_python/src/chkit/core/text_index.py b/chkit_python/src/chkit/core/text_index.py
+new file mode 100644
+index 0000000..c8049fd
+--- /dev/null
++++ b/chkit_python/src/chkit/core/text_index.py
+@@ -0,0 +1,75 @@
++"""Render and parse the ClickHouse ``text(...)`` skip index type.
++
++Mirrors ``packages/core/src/text-index.ts``. ClickHouse keeps parameters in
++the order the DDL was written (``system.data_skipping_indices.type_full``), so
++comparisons go through parse + render rather than string equality.
++"""
++
++from __future__ import annotations
++
++from typing import TYPE_CHECKING, Literal
++
++from chkit.core.key_clause import split_top_level_comma
++from chkit.core.sql_normalizer import normalize_sql_fragment
++
++if TYPE_CHECKING:
++    from chkit.core.model import SkipIndexText
++
++_Kind = Literal["sql", "flag", "number", "string"]
++
++# (model field, DDL key, kind) in render order.
++PARAMS: tuple[tuple[str, str, _Kind], ...] = (
++    ("tokenizer", "tokenizer", "sql"),
++    ("preprocessor", "preprocessor", "sql"),
++    ("postprocessor", "postprocessor", "sql"),
++    ("support_phrase_search", "support_phrase_search", "flag"),
++    ("dictionary_block_size", "dictionary_block_size", "number"),
++    (
++        "dictionary_block_frontcoding_compression",
++        "dictionary_block_frontcoding_compression",
++        "flag",
++    ),
++    ("posting_list_block_size", "posting_list_block_size", "number"),
++    ("posting_list_codec", "posting_list_codec", "string"),
++)
++
++
++def render_text_index_type(index: SkipIndexText) -> str:
++    parts: list[str] = []
++    for field, key, kind in PARAMS:
++        value = getattr(index, field)
++        if value is None:
++            continue
++        if kind == "sql":
++            parts.append(f"{key} = {normalize_sql_fragment(str(value))}")
++        elif kind == "flag":
++            parts.append(f"{key} = {1 if value else 0}")
++        elif kind == "number":
++            parts.append(f"{key} = {value}")
++        else:
++            parts.append(f"{key} = '{value}'")
++    return f"text({', '.join(parts)})"
++
++
++def parse_text_index_params(args: str) -> dict[str, str | bool | int]:
++    """Parse the argument list of a ``text(...)`` index type into model fields."""
++    values: dict[str, str] = {}
++    for part in split_top_level_comma(args):
++        key, sep, raw = part.partition("=")
++        if sep:
++            values[key.strip()] = raw.strip()
++    params: dict[str, str | bool | int] = {"tokenizer": ""}
++    for field, key, kind in PARAMS:
++        value = values.get(key)
++        if value is None:
++            continue
++        if kind == "sql":
++            params[field] = normalize_sql_fragment(value)
++        elif kind == "flag":
++            params[field] = value == "1" or value.lower() == "true"
++        elif kind == "number":
++            params[field] = int(value)
++        else:
++            quoted = len(value) > 1 and value[0] == value[-1] == "'"
++            params[field] = value[1:-1] if quoted else value
++    return params
+diff --git a/chkit_python/src/chkit/core/validate.py b/chkit_python/src/chkit/core/validate.py
+index c6ba801..70c42a9 100644
+--- a/chkit_python/src/chkit/core/validate.py
++++ b/chkit_python/src/chkit/core/validate.py
+@@ -86,6 +86,29 @@ def _validate_column_codec(
+         )
+ 
+ 
++def _validate_indexes(definition: TableDefinition, issues: list[ValidationIssue]) -> None:
++    index_seen: set[str] = set()
++    for index in definition.indexes or []:
++        if index.name in index_seen:
++            _push(
++                issues,
++                definition,
++                "duplicate_index_name",
++                f'Table {definition.database}.{definition.name} '
++                f'has duplicate index name "{index.name}"',
++            )
++            continue
++        index_seen.add(index.name)
++        if index.type == "text" and index.tokenizer.strip() == "":
++            _push(
++                issues,
++                definition,
++                "text_index_missing_tokenizer",
++                f'Text index "{index.name}" on {definition.database}.{definition.name} '
++                f"requires a tokenizer",
++            )
++
++
+ def _validate_table(definition: TableDefinition, issues: list[ValidationIssue]) -> None:
+     column_seen: set[str] = set()
+     column_set: set[str] = set()
+@@ -103,18 +126,7 @@ def _validate_table(definition: TableDefinition, issues: list[ValidationIssue])
+         column_set.add(column.name)
+         _validate_column_codec(definition, column, issues)
+ 
+-    index_seen: set[str] = set()
+-    for index in definition.indexes or []:
+-        if index.name in index_seen:
+-            _push(
+-                issues,
+-                definition,
+-                "duplicate_index_name",
+-                f'Table {definition.database}.{definition.name} '
+-                f'has duplicate index name "{index.name}"',
+-            )
+-            continue
+-        index_seen.add(index.name)
++    _validate_indexes(definition, issues)
+ 
+     projection_seen: set[str] = set()
+     for projection in definition.projections or []:
+diff --git a/chkit_python/tests/test_index_parity.py b/chkit_python/tests/test_index_parity.py
+index 13e15ff..c20135c 100644
+--- a/chkit_python/tests/test_index_parity.py
++++ b/chkit_python/tests/test_index_parity.py
+@@ -1378,3 +1378,71 @@ def test_no_issue_when_target_table_is_external() -> None:
+     assert "refresh_append_required_for_replicated_target" not in {
+         i.code for i in issues
+     }
++
++
++def _docs_table(indexes: list[dict[str, Any]]) -> Any:
++    return table(
++        database="app",
++        name="docs",
++        columns=[
++            {"name": "id", "type": "UInt64"},
++            {"name": "title", "type": "String"},
++            {"name": "body", "type": "String"},
++        ],
++        engine="MergeTree()",
++        primaryKey=["id"],
++        orderBy=["id"],
++        indexes=indexes,
++    )
++
++
++def test_renders_text_index_parameters_in_a_fixed_order() -> None:
++    sql = to_create_sql(
++        _docs_table(
++            [
++                {
++                    "name": "idx_title",
++                    "expression": "lower(title)",
++                    "type": "text",
++                    "tokenizer": "ngrams(3)",
++                    "granularity": 100000000,
++                },
++                {
++                    "name": "idx_body",
++                    "expression": "body",
++                    "type": "text",
++                    "postingListCodec": "bitpacking",
++                    "preprocessor": "lower(body)",
++                    "tokenizer": "splitByString([', ', ';'])",
++                    "dictionaryBlockSize": 512,
++                    "supportPhraseSearch": True,
++                    "granularity": 100000000,
++                },
++            ]
++        )
++    )
++    assert "TYPE text(tokenizer = ngrams(3)) GRANULARITY 100000000" in sql
++    assert (
++        "TYPE text(tokenizer = splitByString([', ', ';']), preprocessor = lower(body), "
++        "support_phrase_search = 1, dictionary_block_size = 512, "
++        "posting_list_codec = 'bitpacking') GRANULARITY 100000000"
++    ) in sql
++
++
++def test_reports_a_text_index_without_a_tokenizer() -> None:
++    issues = validate_definitions(
++        [
++            _docs_table(
++                [
++                    {
++                        "name": "idx_body",
++                        "expression": "body",
++                        "type": "text",
++                        "tokenizer": " ",
++                        "granularity": 1,
++                    }
++                ]
++            )
++        ]
++    )
++    assert "text_index_missing_tokenizer" in [issue.code for issue in issues]
+diff --git a/chkit_python/tests/test_introspect.py b/chkit_python/tests/test_introspect.py
+index bb5e3c1..02a0fa6 100644
+--- a/chkit_python/tests/test_introspect.py
++++ b/chkit_python/tests/test_introspect.py
+@@ -29,6 +29,7 @@ from chkit.core.model import (
+     SkipIndexMinmax,
+     SkipIndexNgramBF,
+     SkipIndexSet,
++    SkipIndexText,
+     SkipIndexTokenBF,
+ )
+ 
+@@ -193,6 +194,27 @@ def test_normalize_index_ngrambf_v1() -> None:
+     assert idx.hash_functions == 4
+ 
+ 
++def test_normalize_index_text_with_parameters_in_written_order() -> None:
++    row = SystemSkippingIndexRow(
++        database="db",
++        table="t",
++        name="idx",
++        expr="body",
++        type=(
++            "text(posting_list_codec = 'bitpacking', tokenizer = splitByString([', ', ';']), "
++            "dictionary_block_size = 512, preprocessor = lower(body))"
++        ),
++        granularity=100000000,
++    )
++    idx = normalize_index_from_system_row(row)
++    assert isinstance(idx, SkipIndexText)
++    assert idx.tokenizer == "splitByString([', ', ';'])"
++    assert idx.preprocessor == "lower(body)"
++    assert idx.dictionary_block_size == 512
++    assert idx.posting_list_codec == "bitpacking"
++    assert idx.support_phrase_search is None
++
++
+ def test_normalize_index_set_with_max_rows() -> None:
+     row = SystemSkippingIndexRow(
+         database="db",
+diff --git a/chkit_python/tests/test_pull.py b/chkit_python/tests/test_pull.py
+index e613084..8382814 100644
+--- a/chkit_python/tests/test_pull.py
++++ b/chkit_python/tests/test_pull.py
+@@ -22,6 +22,7 @@ from chkit.core.model import (
+     MaterializedViewRefresh,
+     SkipIndexBloomFilter,
+     SkipIndexMinmax,
++    SkipIndexText,
+     TableRef,
+ )
+ 
+@@ -280,6 +281,32 @@ def test_render_indexes_include_bloom_filter_rate() -> None:
+     assert "false_positive_rate=0.01" in output
+ 
+ 
++def test_render_indexes_include_text_parameters() -> None:
++    t = table(
++        database="db",
++        name="t",
++        engine="MergeTree",
++        columns=[ColumnDefinition(name="body", type="String")],
++        primary_key=["body"],
++        order_by=["body"],
++        indexes=[
++            SkipIndexText(
++                name="idx",
++                expression="body",
++                granularity=100000000,
++                tokenizer="splitByString([', ', ';'])",
++                preprocessor="lower(body)",
++                dictionary_block_size=512,
++                posting_list_codec="bitpacking",
++            )
++        ],
++    )
++    output = render_schema_file([t])
++    namespace: dict[str, Any] = {}
++    exec(compile(output, "schema.py", "exec"), namespace)
++    assert namespace["definitions"][0].indexes == t.indexes
++
++
+ # ---------- CLI: chkit pull (rejection paths) ----------
+ 
+ 
+diff --git a/chkit_python/tests/test_sql_validation_e2e.py b/chkit_python/tests/test_sql_validation_e2e.py
+index 1c42479..2908e51 100644
+--- a/chkit_python/tests/test_sql_validation_e2e.py
++++ b/chkit_python/tests/test_sql_validation_e2e.py
+@@ -537,6 +537,17 @@ _INDEX_CASES: list[tuple[str, dict[str, Any]]] = [
+             "granularity": 1,
+         },
+     ),
++    (
++        "text",
++        {
++            "name": "idx_text",
++            "expression": "lower(name)",
++            "type": "text",
++            "tokenizer": "ngrams(3)",
++            "preprocessor": "lower(name)",
++            "granularity": 100000000,
++        },
++    ),
+     (
+         "expression index",
+         {
+@@ -978,6 +989,17 @@ _ALTER_ADD_INDEX_CASES: list[tuple[str, dict[str, Any]]] = [
+             "granularity": 1,
+         },
+     ),
++    (
++        "text",
++        {
++            "name": "idx_text",
++            "expression": "lower(name)",
++            "type": "text",
++            "tokenizer": "ngrams(3)",
++            "preprocessor": "lower(name)",
++            "granularity": 100000000,
++        },
++    ),
+ ]
+ 
+ 
+diff --git a/packages/cli/src/commands/drift/compare.ts b/packages/cli/src/commands/drift/compare.ts
+index 009fae9..a79fdb7 100644
+--- a/packages/cli/src/commands/drift/compare.ts
++++ b/packages/cli/src/commands/drift/compare.ts
+@@ -3,6 +3,7 @@ import {
+   isIndexProjection,
+   normalizeProjectionIndex,
+   normalizeSQLFragment,
++  renderTextIndexType,
+   type ColumnDefinition,
+   type ProjectionDefinition,
+   type SkipIndexDefinition,
+@@ -217,6 +218,8 @@ function renderIndexTypeFingerprint(index: SkipIndexDefinition): string {
+       return `tokenbf_v1(${index.sizeBytes}, ${index.hashFunctions}, ${index.randomSeed})`
+     case 'ngrambf_v1':
+       return `ngrambf_v1(${index.ngramSize}, ${index.sizeBytes}, ${index.hashFunctions}, ${index.randomSeed})`
++    case 'text':
++      return renderTextIndexType(index)
+   }
+ }
+ 
+diff --git a/packages/cli/src/test/drift.e2e.test.ts b/packages/cli/src/test/drift.e2e.test.ts
+index 971d92f..e374494 100644
+--- a/packages/cli/src/test/drift.e2e.test.ts
++++ b/packages/cli/src/test/drift.e2e.test.ts
+@@ -29,6 +29,10 @@ function renderIndexedSchema(database: string, usersTableName: string): string {
+   return `import { schema, table } from '${CORE_ENTRY}'\n\nconst users = table({\n  database: '${database}',\n  name: '${usersTableName}',\n  columns: [\n    { name: 'id', type: 'UInt64' },\n    { name: 'email', type: 'String' },\n  ],\n  engine: 'MergeTree()',\n  primaryKey: ['id'],\n  orderBy: ['id'],\n  indexes: [\n    { name: 'idx_set', expression: 'email', type: 'set', maxRows: 0, granularity: 1 },\n    { name: 'idx_bloom', expression: 'email', type: 'bloom_filter', falsePositiveRate: 0.01, granularity: 1 },\n    { name: 'idx_ngram', expression: 'lower(email)', type: 'ngrambf_v1', ngramSize: 3, sizeBytes: 4096, hashFunctions: 2, randomSeed: 0, granularity: 1 },\n  ],\n})\n\nexport default schema(users)\n`
+ }
+ 
++function renderTextIndexSchema(database: string, usersTableName: string): string {
++  return `import { schema, table } from '${CORE_ENTRY}'\n\nconst users = table({\n  database: '${database}',\n  name: '${usersTableName}',\n  columns: [\n    { name: 'id', type: 'UInt64' },\n    { name: 'email', type: 'String' },\n    { name: 'bio', type: 'String' },\n  ],\n  engine: 'MergeTree()',\n  primaryKey: ['id'],\n  orderBy: ['id'],\n  indexes: [\n    { name: 'idx_email', expression: 'lower(email)', type: 'text', tokenizer: 'ngrams(3)', granularity: 100000000 },\n    { name: 'idx_bio', expression: 'bio', type: 'text', tokenizer: "splitByString([', ', ';'])", preprocessor: 'lower(bio)', dictionaryBlockSize: 512, postingListCodec: 'bitpacking', granularity: 100000000 },\n  ],\n})\n\nexport default schema(users)\n`
++}
++
+ interface E2EFixture {
+   dir: string
+   configPath: string
+@@ -386,4 +390,52 @@ describe('@chkit/cli drift depth env e2e', () => {
+     },
+     240_000
+   )
++
++  test(
++    'reports no drift for text indexes right after migrate',
++    async () => {
++      const executor = createLiveExecutor(liveEnv)
++      const database = liveEnv.clickhouseDatabase
++      const journalTable = createJournalTableName('drift_text_index')
++      const cliEnv = { CHKIT_JOURNAL_TABLE: journalTable }
++      const prefix = createPrefix('drift_text_index')
++      const usersTable = `${prefix}users`
++      const fixture = await createFixture({ database, usersTableName: usersTable })
++
++      try {
++        await writeFile(fixture.schemaPath, renderTextIndexSchema(database, usersTable), 'utf8')
++        const generated = runCli(fixture.dir, ['generate', '--config', fixture.configPath, '--json'], cliEnv)
++        expect(generated.exitCode).toBe(0)
++
++        const executed = await runCliWithRetry(
++          fixture.dir,
++          ['migrate', '--config', fixture.configPath, '--execute', '--json'],
++          { extraEnv: cliEnv }
++        )
++        if (executed.exitCode !== 0) {
++          throw new Error(formatTestDiagnostic('migrate --execute failed', executed))
++        }
++        await waitForTable(executor, database, usersTable)
++
++        const driftResult = runCli(
++          fixture.dir,
++          ['drift', '--config', fixture.configPath, '--table', `${database}.${usersTable}`, '--json'],
++          cliEnv
++        )
++        expect(driftResult.exitCode).toBe(0)
++        const driftPayload = JSON.parse(driftResult.stdout) as {
++          drifted: boolean
++          tableDrift: Array<{ table: string; reasonCodes: string[] }>
++        }
++        expect(driftPayload.tableDrift).toEqual([])
++        expect(driftPayload.drifted).toBe(false)
++      } finally {
++        await rm(fixture.dir, { recursive: true, force: true })
++        await executor.command(`DROP TABLE IF EXISTS ${quoteIdent(database)}.${quoteIdent(usersTable)}`)
++        await executor.command(`DROP TABLE IF EXISTS ${quoteIdent(database)}.${quoteIdent(journalTable)}`)
++        await executor.close()
++      }
++    },
++    240_000
++  )
+ })
+diff --git a/packages/clickhouse/src/index.test.ts b/packages/clickhouse/src/index.test.ts
+index c6c45a3..0c04032 100644
+--- a/packages/clickhouse/src/index.test.ts
++++ b/packages/clickhouse/src/index.test.ts
+@@ -10,6 +10,7 @@ import {
+   createStatelessClickHouseClient,
+   formatConnectionError,
+   inferSchemaKindFromEngine,
++  normalizeIndexFromSystemRow,
+   parseCommentFromCreateDictionaryQuery,
+   parseDictionaryAttributesFromCreateDictionaryQuery,
+   parseDictionaryPrimaryKeyFromCreateDictionaryQuery,
+@@ -513,6 +514,47 @@ ORDER BY a`
+   })
+ })
+ 
++describe('normalizeIndexFromSystemRow', () => {
++  const row = (type: string) => ({
++    database: 'app',
++    table: 'docs',
++    name: 'idx',
++    expr: '(body)',
++    type,
++    granularity: 100000000,
++  })
++
++  test('parses text index parameters from type_full in any order', () => {
++    expect(
++      normalizeIndexFromSystemRow(
++        row(
++          "text(preprocessor = lower(body), tokenizer = splitByString([', ', ';']), posting_list_codec = 'bitpacking', dictionary_block_size = 512, support_phrase_search = 1)"
++        )
++      )
++    ).toEqual({
++      name: 'idx',
++      expression: '(body)',
++      granularity: 100000000,
++      type: 'text',
++      tokenizer: "splitByString([', ', ';'])",
++      preprocessor: 'lower(body)',
++      postingListCodec: 'bitpacking',
++      dictionaryBlockSize: 512,
++      supportPhraseSearch: true,
++    })
++  })
++
++  test('parses ngrambf_v1 arguments from type_full', () => {
++    expect(normalizeIndexFromSystemRow(row('ngrambf_v1(3, 4096, 2, 0)'))).toMatchObject({
++      type: 'ngrambf_v1',
++      ngramSize: 3,
++      sizeBytes: 4096,
++      hashFunctions: 2,
++      randomSeed: 0,
++    })
++  })
++})
++
+ describe('formatConnectionError', () => {
+   // The full server blurb chkit must NOT leak (Cloud reset URL + on-disk paths).
+   const rawAuthBlurb =
+diff --git a/packages/clickhouse/src/index.ts b/packages/clickhouse/src/index.ts
+index bc3376f..4d99c89 100644
+--- a/packages/clickhouse/src/index.ts
++++ b/packages/clickhouse/src/index.ts
+@@ -5,6 +5,7 @@ import {
+ 	normalizeSQLFragment,
+ 	type ProjectionDefinition,
+ 	parseCodec,
++	parseTextIndexParams,
+ 	type SkipIndexDefinition,
+ } from '@chkit/core'
+ import { type ClickHouseSettings, ClickHouseLogLevel, createClient } from '@clickhouse/client'
+@@ -221,6 +222,7 @@ type ParsedIndexShape =
+ 			hashFunctions: number
+ 			randomSeed: number
+ 	  }
++	| ({ type: 'text' } & ReturnType<typeof parseTextIndexParams>)
+ 
+ function splitArgs(args: string | undefined): number[] {
+ 	if (args === undefined) return []
+@@ -231,8 +233,11 @@ function splitArgs(args: string | undefined): number[] {
+ }
+ 
+ function parseIndexType(value: string): ParsedIndexShape {
+-	const match = value.match(/^(\w+)\((.+)\)$/)
++	const match = value.match(/^(\w+)\((.+)\)$/s)
+ 	const baseName = match?.[1] ?? value
++	if (baseName === 'text') {
++		return { type: 'text', ...parseTextIndexParams(match?.[2] ?? '') }
++	}
+ 	const args = splitArgs(match?.[2])
+ 
+ 	switch (baseName) {
+diff --git a/packages/core/src/canonical.ts b/packages/core/src/canonical.ts
+index ae077f5..e633155 100644
+--- a/packages/core/src/canonical.ts
++++ b/packages/core/src/canonical.ts
+@@ -38,9 +38,14 @@ function canonicalizeColumn(column: ColumnDefinition): ColumnDefinition {
+ }
+ 
+ function canonicalizeIndex(index: SkipIndexDefinition): SkipIndexDefinition {
++  const expression = normalizeSQLFragment(index.expression)
++  if (index.type !== 'text') return { ...index, expression }
+   return {
+     ...index,
+-    expression: normalizeSQLFragment(index.expression),
++    expression,
++    tokenizer: normalizeSQLFragment(index.tokenizer),
++    preprocessor: index.preprocessor ? normalizeSQLFragment(index.preprocessor) : undefined,
++    postprocessor: index.postprocessor ? normalizeSQLFragment(index.postprocessor) : undefined,
+   }
+ }
+ 
+diff --git a/packages/core/src/index.test.ts b/packages/core/src/index.test.ts
+index 62ffbf3..3574188 100644
+--- a/packages/core/src/index.test.ts
++++ b/packages/core/src/index.test.ts
+@@ -1124,6 +1124,56 @@ describe('@chkit/core planner v1', () => {
+     expect(sql).toContain('TYPE ngrambf_v1(3, 256, 2, 0) GRANULARITY 1')
+   })
+ 
++  test('renders text index parameters in a fixed order', () => {
++    const docs = table({
++      database: 'app',
++      name: 'docs',
++      columns: [
++        { name: 'id', type: 'UInt64' },
++        { name: 'title', type: 'String' },
++        { name: 'body', type: 'String' },
++      ],
++      engine: 'MergeTree()',
++      primaryKey: ['id'],
++      orderBy: ['id'],
++      indexes: [
++        { name: 'idx_title', expression: 'lower(title)', type: 'text', tokenizer: 'ngrams(3)', granularity: 100000000 },
++        {
++          name: 'idx_body',
++          expression: 'body',
++          type: 'text',
++          postingListCodec: 'bitpacking',
++          preprocessor: 'lower(body)',
++          tokenizer: "splitByString([', ', ';'])",
++          dictionaryBlockSize: 512,
++          supportPhraseSearch: true,
++          granularity: 100000000,
++        },
++      ],
++    })
++
++    const sql = toCreateSQL(docs)
++    expect(sql).toContain('TYPE text(tokenizer = ngrams(3)) GRANULARITY 100000000')
++    expect(sql).toContain(
++      "TYPE text(tokenizer = splitByString([', ', ';']), preprocessor = lower(body), support_phrase_search = 1, dictionary_block_size = 512, posting_list_codec = 'bitpacking') GRANULARITY 100000000"
++    )
++  })
++
++  test('reports a text index without a tokenizer', () => {
++    const issues = validateDefinitions([
++      table({
++        database: 'app',
++        name: 'docs',
++        columns: [{ name: 'id', type: 'UInt64' }, { name: 'body', type: 'String' }],
++        engine: 'MergeTree()',
++        primaryKey: ['id'],
++        orderBy: ['id'],
++        indexes: [{ name: 'idx_body', expression: 'body', type: 'text', tokenizer: ' ', granularity: 1 }],
++      }),
++    ])
++    expect(issues.map((issue) => issue.code)).toContain('text_index_missing_tokenizer')
++  })
++
+   test('renders structured index args in ALTER ADD INDEX', () => {
+     const oldDefs = [
+       table({
+diff --git a/packages/core/src/index.ts b/packages/core/src/index.ts
+index 1743f34..db1c73b 100644
+--- a/packages/core/src/index.ts
++++ b/packages/core/src/index.ts
+@@ -12,6 +12,7 @@ export { splitTopLevelComma } from './key-clause.js'
+ export { isIndexProjection, normalizeProjectionIndex } from './projection.js'
+ export { normalizeEngine, normalizeSQLFragment } from './sql-normalizer.js'
+ export { renderDictionarySQL, toCreateSQL } from './sql.js'
++export { parseTextIndexParams, renderTextIndexType } from './text-index.js'
+ export { applyOnClusterToPlan, onClusterClause } from './on-cluster.js'
+ export {
+   canonicalizeCodec,
+diff --git a/packages/core/src/model-types.ts b/packages/core/src/model-types.ts
+index c4a29ff..c9467b7 100644
+--- a/packages/core/src/model-types.ts
++++ b/packages/core/src/model-types.ts
+@@ -76,6 +76,8 @@ interface SkipIndexBase {
+  * - `bloom_filter([false_positive_rate])` — optional float, default 0.025
+  * - `tokenbf_v1(size_bytes, n_hash, seed)` — 3 required ints
+  * - `ngrambf_v1(n, size_bytes, n_hash, seed)` — 4 required ints
++ * - `text(tokenizer = ..., ...)` — named parameters; `tokenizer` is required
++ *   (ClickHouse 26.2+)
+  *
+  * ClickHouse 26+ requires `set(0)` not bare `set`; `maxRows` is required
+  * so this is encoded naturally.
+@@ -98,6 +100,18 @@ export type SkipIndexDefinition = SkipIndexBase &
+         hashFunctions: number
+         randomSeed: number
+       }
++    | {
++        type: 'text'
++        /** e.g. `ngrams(3)`, `splitByNonAlpha`, `splitByString([', '])` */
++        tokenizer: string
++        preprocessor?: string
++        postprocessor?: string
++        supportPhraseSearch?: boolean
++        dictionaryBlockSize?: number
++        dictionaryBlockFrontcodingCompression?: boolean
++        postingListBlockSize?: number
++        postingListCodec?: 'none' | 'bitpacking'
++      }
+   )
+ 
+ export interface SelectProjectionDefinition {
+@@ -376,6 +390,7 @@ export type ValidationIssueCode =
+   | 'duplicate_object_name'
+   | 'duplicate_column_name'
+   | 'duplicate_index_name'
++  | 'text_index_missing_tokenizer'
+   | 'duplicate_projection_name'
+   | 'projection_ambiguous_kind'
+   | 'projection_empty_index'
+diff --git a/packages/core/src/sql-validation.e2e.test.ts b/packages/core/src/sql-validation.e2e.test.ts
+index 5eb8fd9..8ce6339 100644
+--- a/packages/core/src/sql-validation.e2e.test.ts
++++ b/packages/core/src/sql-validation.e2e.test.ts
+@@ -610,6 +610,17 @@ ORDER BY (\`id\`, toDate(\`created_at\`))`
+           granularity: 1,
+         },
+       },
++      {
++        label: 'text',
++        idx: {
++          name: 'idx_text',
++          expression: 'lower(name)',
++          type: 'text',
++          tokenizer: 'ngrams(3)',
++          preprocessor: 'lower(name)',
++          granularity: 100000000,
++        },
++      },
+       {
+         label: 'expression index',
+         idx: { name: 'idx_lower', expression: 'lower(name)', type: 'bloom_filter', granularity: 1 },
+@@ -1128,6 +1139,17 @@ ORDER BY (\`id\`, toDate(\`created_at\`))`
+           granularity: 1,
+         },
+       },
++      {
++        label: 'text',
++        idx: {
++          name: 'idx_text',
++          expression: 'lower(name)',
++          type: 'text',
++          tokenizer: 'ngrams(3)',
++          preprocessor: 'lower(name)',
++          granularity: 100000000,
++        },
++      },
+     ]
+ 
+     for (const { label, idx } of indexCases) {
+diff --git a/packages/core/src/sql.ts b/packages/core/src/sql.ts
+index fe5e9fc..ebb2371 100644
+--- a/packages/core/src/sql.ts
++++ b/packages/core/src/sql.ts
+@@ -13,6 +13,7 @@ import type {
+ import { renderCodec } from './codec.js'
+ import { isPlainColumnReference, normalizeKeyColumns } from './key-clause.js'
+ import { renderProjectionBody } from './projection.js'
++import { renderTextIndexType } from './text-index.js'
+ import { assertValidDefinitions } from './validate.js'
+ 
+ function renderDefault(value: string | number | boolean): string {
+@@ -56,6 +57,8 @@ function renderIndexType(idx: SkipIndexDefinition): string {
+       return `tokenbf_v1(${idx.sizeBytes}, ${idx.hashFunctions}, ${idx.randomSeed})`
+     case 'ngrambf_v1':
+       return `ngrambf_v1(${idx.ngramSize}, ${idx.sizeBytes}, ${idx.hashFunctions}, ${idx.randomSeed})`
++    case 'text':
++      return renderTextIndexType(idx)
+   }
+ }
+ 
+diff --git a/packages/core/src/text-index.ts b/packages/core/src/text-index.ts
+new file mode 100644
+index 0000000..ab69481
+--- /dev/null
++++ b/packages/core/src/text-index.ts
+@@ -0,0 +1,83 @@
++import { splitTopLevelComma } from './key-clause.js'
++import type { SkipIndexDefinition } from './model-types.js'
++import { normalizeSQLFragment } from './sql-normalizer.js'
++
++export type TextSkipIndex = Extract<SkipIndexDefinition, { type: 'text' }>
++type TextIndexParams = Omit<TextSkipIndex, 'name' | 'expression' | 'granularity' | 'type'>
++
++/**
++ * `text(...)` parameters in the order chkit renders them. ClickHouse keeps the
++ * order the DDL was written in (`system.data_skipping_indices.type_full`), so
++ * comparisons go through parse + render rather than string equality.
++ */
++const PARAMS = [
++  { field: 'tokenizer', key: 'tokenizer', kind: 'sql' },
++  { field: 'preprocessor', key: 'preprocessor', kind: 'sql' },
++  { field: 'postprocessor', key: 'postprocessor', kind: 'sql' },
++  { field: 'supportPhraseSearch', key: 'support_phrase_search', kind: 'flag' },
++  { field: 'dictionaryBlockSize', key: 'dictionary_block_size', kind: 'number' },
++  {
++    field: 'dictionaryBlockFrontcodingCompression',
++    key: 'dictionary_block_frontcoding_compression',
++    kind: 'flag',
++  },
++  { field: 'postingListBlockSize', key: 'posting_list_block_size', kind: 'number' },
++  { field: 'postingListCodec', key: 'posting_list_codec', kind: 'string' },
++] as const satisfies ReadonlyArray<{
++  field: keyof TextIndexParams
++  key: string
++  kind: 'sql' | 'flag' | 'number' | 'string'
++}>
++
++export function renderTextIndexType(index: TextIndexParams): string {
++  const parts: string[] = []
++  for (const param of PARAMS) {
++    const value = index[param.field]
++    if (value === undefined) continue
++    switch (param.kind) {
++      case 'sql':
++        parts.push(`${param.key} = ${normalizeSQLFragment(String(value))}`)
++        break
++      case 'flag':
++        parts.push(`${param.key} = ${value ? 1 : 0}`)
++        break
++      case 'number':
++        parts.push(`${param.key} = ${value}`)
++        break
++      case 'string':
++        parts.push(`${param.key} = '${value}'`)
++        break
++    }
++  }
++  return `text(${parts.join(', ')})`
++}
++
++/** Parse the argument list of a `text(...)` index type, e.g. from `type_full`. */
++export function parseTextIndexParams(args: string): TextIndexParams {
++  const values = new Map<string, string>()
++  for (const part of splitTopLevelComma(args)) {
++    const eq = part.indexOf('=')
++    if (eq === -1) continue
++    values.set(part.slice(0, eq).trim(), part.slice(eq + 1).trim())
++  }
++  const params: Record<string, unknown> = { tokenizer: '' }
++  for (const param of PARAMS) {
++    const raw = values.get(param.key)
++    if (raw === undefined) continue
++    switch (param.kind) {
++      case 'sql':
++        params[param.field] = normalizeSQLFragment(raw)
++        break
++      case 'flag':
++        params[param.field] = raw === '1' || raw.toLowerCase() === 'true'
++        break
++      case 'number':
++        params[param.field] = Number(raw)
++        break
++      case 'string':
++        params[param.field] = raw.replace(/^'(.*)'$/, '$1')
++        break
++    }
++  }
++  return params as TextIndexParams
++}
+diff --git a/packages/core/src/validate.ts b/packages/core/src/validate.ts
+index 8960234..0949f37 100644
+--- a/packages/core/src/validate.ts
++++ b/packages/core/src/validate.ts
+@@ -105,6 +105,14 @@ function validateTableDefinition(def: TableDefinition, issues: ValidationIssue[]
+       continue
+     }
+     indexSeen.add(index.name)
++    if (index.type === 'text' && index.tokenizer.trim() === '') {
++      pushValidationIssue(
++        issues,
++        def,
++        'text_index_missing_tokenizer',
++        `Text index "${index.name}" on ${def.database}.${def.name} requires a tokenizer`
++      )
++    }
+   }
+ 
+   const projectionSeen = new Set<string>()
+diff --git a/packages/plugin-pull/src/index.test.ts b/packages/plugin-pull/src/index.test.ts
+index b17d0e7..70b974c 100644
+--- a/packages/plugin-pull/src/index.test.ts
++++ b/packages/plugin-pull/src/index.test.ts
+@@ -244,6 +244,14 @@ export default schema(app_events, app_events_view, analytics_daily_mv)
+             randomSeed: 0,
+             granularity: 1,
+           },
++          {
++            name: 'idx_text',
++            expression: 'lower(body)',
++            type: 'text',
++            tokenizer: 'ngrams(3)',
++            postingListCodec: 'bitpacking',
++            granularity: 100000000,
++          },
+         ],
+       },
+     ])
+@@ -260,6 +268,9 @@ export default schema(app_events, app_events_view, analytics_daily_mv)
+     expect(content).toContain(
+       'type: "ngrambf_v1", ngramSize: 3, sizeBytes: 256, hashFunctions: 2, randomSeed: 0, granularity: 1'
+     )
++    expect(content).toContain(
++      'type: "text", tokenizer: "ngrams(3)", postingListCodec: "bitpacking", granularity: 100000000'
++    )
+     expect(content).not.toContain('typeArgs')
+   })
+ 
+diff --git a/packages/plugin-pull/src/render-schema.ts b/packages/plugin-pull/src/render-schema.ts
+index 486c066..83d6ae4 100644
+--- a/packages/plugin-pull/src/render-schema.ts
++++ b/packages/plugin-pull/src/render-schema.ts
+@@ -237,6 +237,18 @@ function renderIndex(index: SkipIndexDefinition): string {
+         `randomSeed: ${index.randomSeed}`
+       )
+       break
++    case 'text':
++      parts.push(`tokenizer: ${renderString(index.tokenizer)}`)
++      if (index.preprocessor !== undefined) parts.push(`preprocessor: ${renderString(index.preprocessor)}`)
++      if (index.postprocessor !== undefined) parts.push(`postprocessor: ${renderString(index.postprocessor)}`)
++      if (index.supportPhraseSearch !== undefined) parts.push(`supportPhraseSearch: ${index.supportPhraseSearch}`)
++      if (index.dictionaryBlockSize !== undefined) parts.push(`dictionaryBlockSize: ${index.dictionaryBlockSize}`)
++      if (index.dictionaryBlockFrontcodingCompression !== undefined) {
++        parts.push(`dictionaryBlockFrontcodingCompression: ${index.dictionaryBlockFrontcodingCompression}`)
++      }
++      if (index.postingListBlockSize !== undefined) parts.push(`postingListBlockSize: ${index.postingListBlockSize}`)
++      if (index.postingListCodec !== undefined) parts.push(`postingListCodec: ${renderString(index.postingListCodec)}`)
++      break
+   }
+   parts.push(`granularity: ${index.granularity}`)
+   return `{ ${parts.join(', ')} }`
